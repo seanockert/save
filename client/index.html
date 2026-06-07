@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>save</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app" v-scope="App()" @vue:mounted="init" class="container" v-cloak>
+
+    <!-- Login -->
+    <div v-if="!authenticated" class="login">
+      <h1>Save Bookmarks</h1>
+      <form @submit.prevent="login">
+        <input
+          type="password"
+          v-model="password"
+          placeholder="password"
+          autofocus
+        >
+        <button type="submit" :disabled="loggingIn">Login</button>
+      </form>
+      <p v-if="loginError" class="error">{{ loginError }}</p>
+    </div>
+
+    <!-- Main -->
+    <div v-else>
+      <header>
+        <h1>Save Bookmarks</h1>
+        <button @click="logout" class="btn-text">Logout</button>
+      </header>
+
+      <!-- Save form -->
+      <form @submit.prevent="saveBookmark" class="save-form">
+        <input
+          type="url"
+          v-model="newUrl"
+          placeholder="paste a URL..."
+          autofocus
+          @focus="checkClipboard"
+        >
+        <button type="submit" :disabled="saving">
+          {{ saving ? '...' : 'save' }}
+        </button>
+      </form>
+      <p v-if="saveError" class="error">{{ saveError }}</p>
+
+      <!-- Search -->
+      <input
+        type="search"
+        v-model="searchQuery"
+        @input="onSearchInput"
+        placeholder="search..."
+        class="search-input"
+      >
+
+      <!-- Tags -->
+      <div v-if="allTags.length" class="tags-bar">
+        <button
+          v-for="tag in allTags"
+          :key="tag.name"
+          @click="toggleTagFilter(tag.name)"
+          :class="{ active: activeTag === tag.name }"
+          class="tag-pill"
+        >
+          {{ tag.name }} <span class="count">{{ tag.count }}</span>
+        </button>
+      </div>
+
+      <!-- Bookmarks -->
+      <div class="bookmarks">
+        <div v-for="bm in bookmarks" :key="bm.id" class="bookmark-card">
+          <img
+            v-if="bm.image"
+            :src="bm.image"
+            class="bookmark-image"
+            loading="lazy"
+            @error="bm.image = null"
+          >
+          <div class="bookmark-body">
+            <a :href="bm.url" target="_blank" rel="noopener" class="bookmark-title">
+              {{ bm.title || bm.url }}
+            </a>
+            <p v-if="bm.description" class="bookmark-desc">{{ bm.description }}</p>
+            <div class="bookmark-meta">
+              <span class="domain">{{ bm.domain }}</span>
+              <span class="date">{{ formatDate(bm.createdAt) }}</span>
+              <span v-for="tag in bm.tags" :key="tag" class="tag-pill small">{{ tag }}</span>
+            </div>
+          </div>
+          <div class="bookmark-actions">
+            <button @click="editBookmark(bm)" class="btn-text"><svg fill="currentColor" class="icon" viewBox="0 0 20 20"><path d="m5.4 14 1.3-3.2.9-1.4 6.9-6.9a2.1 2.1 0 0 1 3 3l-7 7-1.3.8-3.1 1.3a.5.5 0 0 1-.7-.7"/><path d="M3.5 5.8q.1-1.2 1.3-1.3H10A.8.8 0 0 0 10 3H4.8A3 3 0 0 0 2 5.8v9.5A3 3 0 0 0 4.8 18h9.5a3 3 0 0 0 2.7-2.7V10a.8.8 0 0 0-1.5 0v5.3q-.1 1-1.2 1.2H4.8q-1.2-.1-1.3-1.2z"/></svg></button>
+            <button @click="deleteBookmark(bm.id)" class="btn-text btn-danger"><svg fill="currentColor" class="icon" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M8.8 1A3 3 0 0 0 6 3.8v.4l-2.4.3A.8.8 0 1 0 4 6H4L5 16.5A3 3 0 0 0 7.6 19h4.8a3 3 0 0 0 2.7-2.5L16 6h.1a.8.8 0 0 0 .3-1.5L14 4.2v-.5A3 3 0 0 0 11.3 1zM10 4h2.5v-.2q-.1-1.2-1.2-1.3H8.7q-1 .1-1.2 1.3V4zM8.6 7.7a.8.8 0 0 0-1.5 0l.3 7.6a.8.8 0 1 0 1.5 0zm4.3 0a.8.8 0 1 0-1.5 0l-.3 7.5a.8.8 0 1 0 1.5 0z" clip-rule="evenodd"/></svg></button>
+          </div>
+        </div>
+
+        <p v-if="!loading && bookmarks.length === 0" class="empty">
+          {{ searchQuery || activeTag ? 'no matches' : 'no bookmarks yet' }}
+        </p>
+
+        <p v-if="loading && bookmarks.length === 0" class="loading">loading...</p>
+
+        <button v-if="hasMore && !loading" @click="loadMore" class="btn-text load-more">
+          load more
+        </button>
+      </div>
+
+      <!-- Edit modal -->
+      <div v-if="editing" class="modal-overlay" @click.self="cancelEdit">
+        <div class="modal">
+          <h3>edit bookmark</h3>
+          <label>title</label>
+          <input type="text" v-model="editing.title">
+          <label>description</label>
+          <textarea v-model="editing.description" rows="3"></textarea>
+          <label>tags (comma-separated)</label>
+          <input type="text" v-model="editTagsInput">
+          <div class="modal-actions">
+            <button @click="cancelEdit" class="btn-text">cancel</button>
+            <button @click="updateBookmark" :disabled="saving">save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

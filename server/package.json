@@ -1,0 +1,11 @@
+{
+  "name": "save-server",
+  "private": true,
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250601.0",
+    "wrangler": "^4.0.0"
+  }
+}

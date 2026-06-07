@@ -1,0 +1,15 @@
+{
+  "name": "save",
+  "private": true,
+  "scripts": {
+    "dev": "cd server && bunx wrangler dev --config wrangler.toml",
+    "deploy": "cd server && bunx wrangler deploy --config wrangler.toml",
+    "db:migrate:local": "cd server && bunx wrangler d1 migrations apply save --local --config wrangler.toml",
+    "db:migrate:remote": "cd server && bunx wrangler d1 migrations apply save --remote --config wrangler.toml",
+    "db:create": "bunx wrangler d1 create save",
+    "preview": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.98.0"
+  }
+}
