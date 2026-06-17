@@ -60,6 +60,17 @@ bookmarks.get('/', async (c) => {
   });
 });
 
+// Lightweight change marker for cross-device polling. count catches adds/deletes,
+// maxUpdatedAt catches edits and metadata refreshes — together they detect any change.
+// Registered before '/:id' so 'version' isn't matched as a bookmark id.
+bookmarks.get('/version', async (c) => {
+  const row = await c.env.DB.prepare(
+    'SELECT COUNT(*) as count, MAX(updatedAt) as maxUpdatedAt FROM bookmark'
+  ).first<{ count: number; maxUpdatedAt: string | null }>();
+
+  return c.json({ count: row?.count || 0, maxUpdatedAt: row?.maxUpdatedAt || null });
+});
+
 bookmarks.get('/:id', async (c) => {
   return await getBookmarkWithTags(c.env.DB, c.req.param('id'), c);
 });

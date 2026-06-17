@@ -21,10 +21,49 @@ function App() {
     editTagsInput: '',
 
     _searchTimer: null,
+    _pollTimer: null,
+    _lastVersion: null,
 
     async init() {
       const ok = await this.checkAuth();
       if (ok) {
+        await Promise.all([this.loadBookmarks(true), this.loadTags()]);
+      }
+      this.startPolling();
+    },
+
+    startPolling() {
+      // Poll a tiny version endpoint only while the tab is visible, and check
+      // immediately whenever the tab regains focus — cheap cross-device refresh.
+      this._pollTimer = setInterval(() => {
+        if (document.visibilityState === 'visible') this.checkForUpdates();
+      }, 15000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.checkForUpdates();
+      });
+    },
+
+    async checkForUpdates() {
+      if (!this.authenticated) return;
+      // Don't disrupt deep pagination or an open editor — the change is picked
+      // up on the next poll once we're back on page 1.
+      if (this.page !== 1 || this.editing) return;
+
+      let res;
+      try {
+        res = await this.api('/bookmarks/version');
+      } catch {
+        return;
+      }
+      if (!res) return;
+
+      const version = `${res.count}:${res.maxUpdatedAt || ''}`;
+      if (this._lastVersion === null) {
+        this._lastVersion = version; // establish baseline, don't refresh
+        return;
+      }
+      if (version !== this._lastVersion) {
+        this._lastVersion = version;
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
       }
     },
@@ -104,6 +143,7 @@ function App() {
             }
           }
           this.loadTags();
+          this._lastVersion = null; // re-baseline; our own change isn't a remote update
           this.pollForMetadata(res.id);
         }
       } catch (e) {
@@ -216,6 +256,7 @@ function App() {
 
         this.editing = null;
         this.editTagsInput = '';
+        this._lastVersion = null; // re-baseline after our own edit
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
       } catch (e) {
         alert('Failed to update: ' + e.message);
@@ -229,6 +270,7 @@ function App() {
       try {
         await this.api(`/bookmarks/${id}`, { method: 'DELETE' });
         this.bookmarks = this.bookmarks.filter((b) => b.id !== id);
+        this._lastVersion = null; // re-baseline after our own delete
         await this.loadTags();
       } catch (e) {
         alert('Failed to delete: ' + e.message);
