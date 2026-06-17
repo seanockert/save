@@ -20,21 +20,62 @@ function App() {
     editing: null,
     editTagsInput: '',
 
+    retagging: false,
+    retagProgress: '',
+
     _searchTimer: null,
     _pollTimer: null,
     _lastVersion: null,
 
+    _swipeX: null,
+    _swipeCleared: {},
+
     async init() {
+      this.readQueryParams();
       const ok = await this.checkAuth();
       if (ok) {
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
       }
       this.startPolling();
+      this.startInfiniteScroll();
+      window.addEventListener('popstate', () => {
+        this.readQueryParams();
+        if (this.authenticated) this.loadBookmarks(true);
+      });
+    },
+
+    readQueryParams() {
+      const p = new URLSearchParams(location.search);
+      this.searchQuery = p.get('q') || '';
+      this.activeTag = p.get('tag') || null;
+    },
+
+    writeQueryParams(push) {
+      const p = new URLSearchParams();
+      if (this.searchQuery) p.set('q', this.searchQuery);
+      if (this.activeTag) p.set('tag', this.activeTag);
+      const qs = p.toString();
+      const url = qs ? `${location.pathname}?${qs}` : location.pathname;
+      // push for tag toggles (back button works); replace for search keystrokes
+      if (push) history.pushState(null, '', url);
+      else history.replaceState(null, '', url);
+    },
+
+    startInfiniteScroll() {
+      window.addEventListener(
+        'scroll',
+        () => {
+          if (this.loading || !this.hasMore || !this.authenticated) return;
+          if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 600) {
+            this.loadMore();
+          }
+        },
+        { passive: true }
+      );
     },
 
     startPolling() {
-      // Poll a tiny version endpoint only while the tab is visible, and check
-      // immediately whenever the tab regains focus — cheap cross-device refresh.
+      // Poll the version endpoint while visible, and immediately on refocus.
       this._pollTimer = setInterval(() => {
         if (document.visibilityState === 'visible') this.checkForUpdates();
       }, 15000);
@@ -45,8 +86,7 @@ function App() {
 
     async checkForUpdates() {
       if (!this.authenticated) return;
-      // Don't disrupt deep pagination or an open editor — the change is picked
-      // up on the next poll once we're back on page 1.
+      // Skip while paginated or editing; picked up once back on page 1.
       if (this.page !== 1 || this.editing) return;
 
       let res;
@@ -111,6 +151,38 @@ function App() {
       this.authenticated = false;
       this.bookmarks = [];
       this.allTags = [];
+    },
+
+    async retagAll() {
+      if (this.retagging) return;
+      if (!confirm('Re-generate tags for every bookmark? This replaces all existing tags.')) return;
+      this.retagging = true;
+      this.retagProgress = '0%';
+      try {
+        let offset = 0;
+        let done = false;
+        let failed = 0;
+        while (!done) {
+          const res = await this.api(`/bookmarks/retag?offset=${offset}&limit=20`, { method: 'POST' });
+          if (!res) break;
+          offset = res.nextOffset;
+          done = res.done;
+          failed += res.failed || 0;
+          this.retagProgress = res.total
+            ? `${Math.round((Math.min(offset, res.total) / res.total) * 100)}%`
+            : '100%';
+        }
+        this._lastVersion = null;
+        await Promise.all([this.loadBookmarks(true), this.loadTags()]);
+        if (failed > 0) {
+          alert(`Tag generation failed for ${failed} bookmark${failed === 1 ? '' : 's'} (their existing tags were kept). Check the server logs.`);
+        }
+      } catch (e) {
+        alert('Re-tag failed: ' + e.message);
+      } finally {
+        this.retagging = false;
+        this.retagProgress = '';
+      }
     },
 
     async checkClipboard() {
@@ -179,7 +251,7 @@ function App() {
       try {
         const params = new URLSearchParams({
           page: String(this.page),
-          limit: '20',
+          limit: '50',
         });
         if (this.searchQuery) params.set('search', this.searchQuery);
         if (this.activeTag) params.set('tag', this.activeTag);
@@ -201,15 +273,41 @@ function App() {
       this.loadBookmarks(false);
     },
 
+    swipeStart(e) {
+      this._swipeX = e.changedTouches[0].clientX;
+    },
+
+    // Swipe left clears the field (stashing its value); swipe right restores it.
+    swipeEnd(e, field) {
+      if (this._swipeX === null) return;
+      const dx = e.changedTouches[0].clientX - this._swipeX;
+      this._swipeX = null;
+      if (Math.abs(dx) < 60) return;
+
+      if (dx < 0 && this[field]) {
+        this._swipeCleared[field] = this[field];
+        this[field] = '';
+      } else if (dx > 0 && !this[field] && this._swipeCleared[field]) {
+        this[field] = this._swipeCleared[field];
+        this._swipeCleared[field] = null;
+      } else {
+        return;
+      }
+
+      if (field === 'searchQuery') this.onSearchInput();
+    },
+
     onSearchInput() {
       clearTimeout(this._searchTimer);
       this._searchTimer = setTimeout(() => {
+        this.writeQueryParams(false);
         this.loadBookmarks(true);
       }, 300);
     },
 
     toggleTagFilter(tag) {
       this.activeTag = this.activeTag === tag ? null : tag;
+      this.writeQueryParams(true);
       this.loadBookmarks(true);
     },
 
@@ -220,6 +318,13 @@ function App() {
       } catch {
         // ignore
       }
+    },
+
+    openBookmark(bm) {
+      // Don't navigate if the user is selecting text within the card.
+      const selection = window.getSelection();
+      if (selection && selection.toString().length > 0) return;
+      window.open(bm.url, '_blank', 'noopener');
     },
 
     editBookmark(bm) {

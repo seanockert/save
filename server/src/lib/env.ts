@@ -1,6 +1,7 @@
 export type AppEnv = {
   DB: D1Database;
   ASSETS: Fetcher;
+  AI: Ai;
   AUTH_PASSWORD: string;
   AUTH_SECRET: string;
 };
