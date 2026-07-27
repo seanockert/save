@@ -5,7 +5,7 @@ function App() {
     loggingIn: false,
     loginError: '',
 
-    newUrl: '',
+    omni: '',
     saving: false,
     saveError: '',
 
@@ -13,7 +13,6 @@ function App() {
     loading: false,
     page: 1,
     hasMore: false,
-    searchQuery: '',
     activeTag: null,
     allTags: [],
 
@@ -30,6 +29,10 @@ function App() {
     _swipeX: null,
     _swipeCleared: {},
 
+    pendingDelete: null,
+    _undoTimer: null,
+    _rowScrolled: false,
+
     async init() {
       this.readQueryParams();
       const ok = await this.checkAuth();
@@ -42,17 +45,27 @@ function App() {
         this.readQueryParams();
         if (this.authenticated) this.loadBookmarks(true);
       });
+      window.addEventListener('pagehide', () => this.flushPendingDelete());
+    },
+
+    isUrl() {
+      return /^https?:\/\/.+\..+/.test(this.omni.trim());
+    },
+
+    // Effective filter: a URL in the field means "about to save", not "search".
+    searchTerm() {
+      return this.isUrl() ? '' : this.omni.trim();
     },
 
     readQueryParams() {
       const p = new URLSearchParams(location.search);
-      this.searchQuery = p.get('q') || '';
+      this.omni = p.get('q') || '';
       this.activeTag = p.get('tag') || null;
     },
 
     writeQueryParams(push) {
       const p = new URLSearchParams();
-      if (this.searchQuery) p.set('q', this.searchQuery);
+      if (this.searchTerm()) p.set('q', this.searchTerm());
       if (this.activeTag) p.set('tag', this.activeTag);
       const qs = p.toString();
       const url = qs ? `${location.pathname}?${qs}` : location.pathname;
@@ -75,7 +88,6 @@ function App() {
     },
 
     startPolling() {
-      // Poll the version endpoint while visible, and immediately on refocus.
       this._pollTimer = setInterval(() => {
         if (document.visibilityState === 'visible') this.checkForUpdates();
       }, 15000);
@@ -86,8 +98,8 @@ function App() {
 
     async checkForUpdates() {
       if (!this.authenticated) return;
-      // Skip while paginated or editing; picked up once back on page 1.
-      if (this.page !== 1 || this.editing) return;
+      // Skip while paginated, editing, or holding an undoable delete; picked up later.
+      if (this.page !== 1 || this.editing || this.pendingDelete) return;
 
       let res;
       try {
@@ -185,31 +197,22 @@ function App() {
       }
     },
 
-    async checkClipboard() {
-      if (this.newUrl) return;
-      try {
-        const text = await navigator.clipboard.readText();
-        const trimmed = text.trim();
-        if (/^https?:\/\/.+\..+/.test(trimmed)) {
-          this.newUrl = trimmed;
-        }
-      } catch {
-        // clipboard permission denied — fine
-      }
+    onOmniSubmit() {
+      if (this.isUrl()) this.saveBookmark();
     },
 
     async saveBookmark() {
-      if (!this.newUrl.trim()) return;
+      if (!this.isUrl()) return;
       this.saving = true;
       this.saveError = '';
       try {
         const res = await this.api('/bookmarks', {
           method: 'POST',
-          body: { url: this.newUrl.trim() },
+          body: { url: this.omni.trim() },
         });
         if (res) {
-          this.newUrl = '';
-          if (!this.searchQuery && !this.activeTag) {
+          this.omni = '';
+          if (!this.searchTerm() && !this.activeTag) {
             if (!this.bookmarks.some((b) => b.id === res.id)) {
               this.bookmarks = [res, ...this.bookmarks];
             }
@@ -240,9 +243,7 @@ function App() {
           return;
         }
         this.pollForMetadata(id, attempts + 1);
-      } catch {
-        // metadata poll failed — not critical
-      }
+      } catch {}
     },
 
     async loadBookmarks(reset) {
@@ -253,7 +254,7 @@ function App() {
           page: String(this.page),
           limit: '50',
         });
-        if (this.searchQuery) params.set('search', this.searchQuery);
+        if (this.searchTerm()) params.set('search', this.searchTerm());
         if (this.activeTag) params.set('tag', this.activeTag);
 
         const res = await this.api(`/bookmarks?${params}`);
@@ -294,10 +295,16 @@ function App() {
         return;
       }
 
-      if (field === 'searchQuery') this.onSearchInput();
+      if (field === 'omni') this.onOmniInput();
     },
 
-    onSearchInput() {
+    clearOmni() {
+      if (!this.omni) return;
+      this.omni = '';
+      this.onOmniInput();
+    },
+
+    onOmniInput() {
       clearTimeout(this._searchTimer);
       this._searchTimer = setTimeout(() => {
         this.writeQueryParams(false);
@@ -315,12 +322,15 @@ function App() {
       try {
         const res = await this.api('/tags');
         if (res) this.allTags = res;
-      } catch {
-        // ignore
-      }
+      } catch {}
     },
 
     openBookmark(bm) {
+      // Don't navigate on the click that trails a swipe.
+      if (this._rowScrolled) {
+        this._rowScrolled = false;
+        return;
+      }
       // Don't navigate if the user is selecting text within the card.
       const selection = window.getSelection();
       if (selection && selection.toString().length > 0) return;
@@ -370,16 +380,92 @@ function App() {
       }
     },
 
-    async deleteBookmark(id) {
-      if (!confirm('Delete this bookmark?')) return;
+    // Rest the card between the two panels; browsers don't all apply the initial snap.
+    centerRow(el) {
+      requestAnimationFrame(() => {
+        const edit = el.querySelector('.swipe-edit');
+        if (edit) el.scrollLeft = edit.offsetWidth;
+      });
+    },
+
+    // How far the card has been dragged off its centred rest position.
+    // Positive means swiped left (delete side), negative means swiped right (edit side).
+    swipeOffset(el) {
+      return el.scrollLeft + el.clientWidth / 2 - el.scrollWidth / 2;
+    },
+
+    rowSwipeStart() {
+      this._rowScrolled = false;
+    },
+
+    // Arm past the halfway mark so the panel can signal what a release will do.
+    rowSwipeScroll(e) {
+      const el = e.currentTarget;
+      const dx = this.swipeOffset(el);
+      const threshold = el.clientWidth / 2;
+      this._rowScrolled = true;
+      el.classList.toggle('armed-delete', dx >= threshold);
+      el.classList.toggle('armed-edit', dx <= -threshold);
+    },
+
+    rowSwipeEnd(e, bm) {
+      const el = e.currentTarget;
+      const dx = this.swipeOffset(el);
+      const threshold = el.clientWidth / 2;
+      el.classList.remove('armed-delete', 'armed-edit');
+      if (dx >= threshold) this.requestDelete(bm);
+      else if (dx <= -threshold) this.editBookmark(bm);
+    },
+
+    // Removes the card straight away and holds the DELETE back so it can be undone.
+    requestDelete(bm) {
+      this.commitDelete();
+      const index = this.bookmarks.findIndex((b) => b.id === bm.id);
+      if (index === -1) return;
+      this.bookmarks = this.bookmarks.filter((b) => b.id !== bm.id);
+      this.pendingDelete = { bookmark: bm, index };
+      this._undoTimer = setTimeout(() => this.commitDelete(), 6000);
+    },
+
+    undoDelete() {
+      if (!this.pendingDelete) return;
+      clearTimeout(this._undoTimer);
+      const { bookmark, index } = this.pendingDelete;
+      this.pendingDelete = null;
+      this.restoreBookmark(bookmark, index);
+    },
+
+    async commitDelete() {
+      if (!this.pendingDelete) return;
+      clearTimeout(this._undoTimer);
+      const { bookmark, index } = this.pendingDelete;
+      this.pendingDelete = null;
       try {
-        await this.api(`/bookmarks/${id}`, { method: 'DELETE' });
-        this.bookmarks = this.bookmarks.filter((b) => b.id !== id);
+        await this.api(`/bookmarks/${bookmark.id}`, { method: 'DELETE' });
         this._lastVersion = null; // re-baseline after our own delete
         await this.loadTags();
       } catch (e) {
+        this.restoreBookmark(bookmark, index);
         alert('Failed to delete: ' + e.message);
       }
+    },
+
+    // Send the held DELETE before the page goes away, so it isn't silently dropped.
+    flushPendingDelete() {
+      if (!this.pendingDelete) return;
+      const { bookmark } = this.pendingDelete;
+      this.pendingDelete = null;
+      clearTimeout(this._undoTimer);
+      fetch(`/api/bookmarks/${bookmark.id}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        keepalive: true,
+      }).catch(() => {});
+    },
+
+    restoreBookmark(bookmark, index) {
+      const at = Math.min(index, this.bookmarks.length);
+      this.bookmarks = [...this.bookmarks.slice(0, at), bookmark, ...this.bookmarks.slice(at)];
     },
 
     formatDate(iso) {
