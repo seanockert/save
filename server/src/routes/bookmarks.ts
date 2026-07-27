@@ -85,19 +85,30 @@ bookmarks.post('/retag', async (c) => {
   ).bind(limit, offset).all<{ id: string; url: string; title: string | null; description: string | null; domain: string }>();
 
   const batch = rows.results || [];
-  const existingTags = await getExistingTagNames(db);
+  // Established categories from the DB (used by 2+ bookmarks); one-off tags are
+  // deliberately excluded so they don't reinforce themselves during re-tagging.
+  const dbEstablished = await getEstablishedTagNames(db);
+  // Track categories assigned within this run so a category that recurs here
+  // becomes reusable for later items, even before it's persisted.
+  const runCounts = new Map<string, number>();
 
   let failed = 0;
   for (const b of batch) {
+    const established = [
+      ...new Set([
+        ...dbEstablished,
+        ...[...runCounts].filter(([, n]) => n >= 2).map(([name]) => name),
+      ]),
+    ];
     const tags = await generateTags(
       c.env.AI,
       { url: b.url, domain: b.domain, title: b.title, description: b.description },
-      existingTags
+      established
     );
-    // Non-destructive: only replace a bookmark's tags when generation
-    // produced something. A failed/empty generation leaves existing tags intact
-    // rather than wiping them.
-    if (tags.length === 0) {
+    // A genuine failure (null) leaves existing tags intact rather than wiping
+    // them. A successful result — even an empty one — replaces them, so re-tagging
+    // clears stale, low-quality tags a page no longer warrants.
+    if (tags === null) {
       failed++;
       continue;
     }
@@ -105,8 +116,7 @@ bookmarks.post('/retag', async (c) => {
       db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(b.id),
       ...tagLinkStatements(db, b.id, tags),
     ]);
-    // Grow vocabulary within the run so later items can reuse new tags.
-    for (const t of tags) if (!existingTags.includes(t)) existingTags.push(t);
+    for (const t of tags) runCounts.set(t, (runCounts.get(t) || 0) + 1);
   }
 
   await cleanupOrphanTags(db);
@@ -242,17 +252,17 @@ async function refreshMetadata(db: D1Database, ai: Ai, id: string, url: string) 
 
     await db.prepare(`UPDATE bookmark SET ${updates.join(', ')} WHERE id = ?`).bind(...values, id).run();
 
-    // Tag from the fresh metadata, reusing existing tags where possible.
-    const existingTags = await getExistingTagNames(db);
+    // Tag from the fresh metadata, reusing established categories where possible.
+    const established = await getEstablishedTagNames(db);
     const tags = await generateTags(
       ai,
       { url, domain: extractDomain(url), title: ogData.title, description: ogData.description },
-      existingTags
+      established
     );
 
-    // Only replace tags when generation produced something — a failed/empty
-    // generation should leave any existing tags intact.
-    if (tags.length > 0) {
+    // Only replace tags when generation produced something — a failed (null) or
+    // empty result should leave any existing tags intact on a re-fetch.
+    if (tags && tags.length > 0) {
       await db.batch([
         db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(id),
         ...tagLinkStatements(db, id, tags),
@@ -264,8 +274,17 @@ async function refreshMetadata(db: D1Database, ai: Ai, id: string, url: string) 
   }
 }
 
-async function getExistingTagNames(db: D1Database): Promise<string[]> {
-  const res = await db.prepare('SELECT name FROM tag ORDER BY name ASC').all<{ name: string }>();
+async function getEstablishedTagNames(db: D1Database): Promise<string[]> {
+  // Only categories used by 2+ bookmarks, most-used first. Excluding the
+  // one-off long tail keeps low-quality tags from being fed back to the model
+  // as examples and reinforcing themselves.
+  const res = await db.prepare(
+    `SELECT t.name FROM tag t
+     JOIN bookmark_tag bt ON bt.tagId = t.id
+     GROUP BY t.id
+     HAVING COUNT(bt.bookmarkId) >= 2
+     ORDER BY COUNT(bt.bookmarkId) DESC, t.name ASC`
+  ).all<{ name: string }>();
   return (res.results || []).map((r) => r.name);
 }
 
