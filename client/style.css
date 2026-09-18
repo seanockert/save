@@ -27,7 +27,7 @@
   --font-size-small: 85%;
   --radius: 0.375rem;
 
-  color-scheme: light dark;
+  color-scheme: light;
 }
 
 body {
@@ -144,7 +144,7 @@ textarea {
   padding: 0.5rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--bg);
+  background: transparent;
 }
 
 textarea {
@@ -189,15 +189,15 @@ button svg {
   background: none;
 }
 
-  button:not(:disabled):hover,
-  button:not(:disabled):focus-visible {
-    transform: scale(1.04);
-    background: var(--bg-hover);
-  }
+button:not(:disabled):hover,
+button:not(:disabled):focus-visible {
+  transform: scale(1.04);
+  background: var(--bg-hover);
+}
 
-button:active {
-  background: var(--accent);
-  color: var(--lightest);
+button:not(:disabled):active {
+  background: var(--green);
+  color: var(--fg);
   transform: scale(0.98);
 }
 
@@ -254,7 +254,6 @@ header {
   flex: 1;
   font-size: 1.125rem;
   padding: var(--size-base);
-  background-color: var(--fg);
   color: var(--darkest);
   border: none;
   border-radius: 0;
@@ -267,6 +266,10 @@ header {
 .save-form ::placeholder {
   color: var(--green-alt);
   opacity: 1;
+}
+
+.save-form button {
+  background-color: transparent;
 }
 
 .omni-hint {
