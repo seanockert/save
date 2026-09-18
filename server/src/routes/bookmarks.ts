@@ -3,6 +3,7 @@ import { requireAuth } from '../lib/auth';
 import { sanitizeUrl, extractDomain } from '../lib/sanitize';
 import { fetchOpenGraph, fallbackFromUrl } from '../lib/opengraph';
 import { generateTags } from '../lib/tags';
+import { publish } from '../lib/sync';
 import type { AppEnv } from '../lib/env';
 
 const bookmarks = new Hono<{ Bindings: AppEnv }>();
@@ -122,7 +123,13 @@ bookmarks.post('/retag', async (c) => {
   await cleanupOrphanTags(db);
 
   const nextOffset = offset + batch.length;
-  return c.json({ processed: batch.length, failed, total, nextOffset, done: nextOffset >= total || batch.length === 0 });
+  const done = nextOffset >= total || batch.length === 0;
+
+  // Re-tagging touches every bookmark, so tell clients to reload rather than
+  // publishing an event per row.
+  if (done) c.executionCtx.waitUntil(publish(c.env, { type: 'refresh' }));
+
+  return c.json({ processed: batch.length, failed, total, nextOffset, done });
 });
 
 bookmarks.get('/:id', async (c) => {
@@ -149,7 +156,7 @@ bookmarks.post('/', async (c) => {
   const existing = await db.prepare('SELECT id FROM bookmark WHERE url = ?').bind(cleanUrl).first<{ id: string }>();
 
   if (existing) {
-    c.executionCtx.waitUntil(refreshMetadata(db, c.env.AI, existing.id, cleanUrl));
+    c.executionCtx.waitUntil(refreshMetadata(c.env, existing.id, cleanUrl));
     return await getBookmarkWithTags(db, existing.id, c);
   }
 
@@ -162,9 +169,7 @@ bookmarks.post('/', async (c) => {
     'INSERT INTO bookmark (id, url, title, description, image, domain, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(id, cleanUrl, fallback.title, null, null, domain, now, now).run();
 
-  c.executionCtx.waitUntil(refreshMetadata(db, c.env.AI, id, cleanUrl));
-
-  return c.json({
+  const created = {
     id,
     url: cleanUrl,
     title: fallback.title,
@@ -174,7 +179,12 @@ bookmarks.post('/', async (c) => {
     createdAt: now,
     updatedAt: now,
     tags: [],
-  }, 201);
+  };
+
+  c.executionCtx.waitUntil(publish(c.env, { type: 'created', bookmark: created }));
+  c.executionCtx.waitUntil(refreshMetadata(c.env, id, cleanUrl));
+
+  return c.json(created, 201);
 });
 
 bookmarks.put('/:id', async (c) => {
@@ -211,7 +221,12 @@ bookmarks.put('/:id', async (c) => {
     await cleanupOrphanTags(db);
   }
 
-  return await getBookmarkWithTags(db, id, c);
+  const bookmark = await fetchBookmark(db, id);
+  if (!bookmark) return c.json({ error: 'Bookmark not found' }, 404);
+
+  c.executionCtx.waitUntil(publish(c.env, { type: 'updated', bookmark }));
+
+  return c.json(bookmark);
 });
 
 bookmarks.delete('/:id', async (c) => {
@@ -226,10 +241,13 @@ bookmarks.delete('/:id', async (c) => {
   // links cascade-delete; clear any now-orphaned tags
   await cleanupOrphanTags(db);
 
+  c.executionCtx.waitUntil(publish(c.env, { type: 'deleted', id }));
+
   return c.json({ ok: true });
 });
 
-async function refreshMetadata(db: D1Database, ai: Ai, id: string, url: string) {
+async function refreshMetadata(env: AppEnv, id: string, url: string) {
+  const db = env.DB;
   try {
     const ogData = await fetchOpenGraph(url);
     const now = new Date().toISOString();
@@ -255,7 +273,7 @@ async function refreshMetadata(db: D1Database, ai: Ai, id: string, url: string) 
     // Tag from the fresh metadata, reusing established categories where possible.
     const established = await getEstablishedTagNames(db);
     const tags = await generateTags(
-      ai,
+      env.AI,
       { url, domain: extractDomain(url), title: ogData.title, description: ogData.description },
       established
     );
@@ -269,8 +287,13 @@ async function refreshMetadata(db: D1Database, ai: Ai, id: string, url: string) 
       ]);
       await cleanupOrphanTags(db);
     }
+
+    // The title, image and tags land well after the save, so push the finished
+    // row to every client.
+    const bookmark = await fetchBookmark(db, id);
+    if (bookmark) await publish(env, { type: 'updated', bookmark });
   } catch {
-    // Background task — metadata/tags are best-effort; the bookmark is saved.
+    // Background task — metadata, tags and the broadcast are best-effort; the bookmark is saved.
   }
 }
 
@@ -294,6 +317,12 @@ async function cleanupOrphanTags(db: D1Database): Promise<void> {
 }
 
 async function getBookmarkWithTags(db: D1Database, id: string, c: any) {
+  const bookmark = await fetchBookmark(db, id);
+  if (!bookmark) return c.json({ error: 'Bookmark not found' }, 404);
+  return c.json(bookmark);
+}
+
+async function fetchBookmark(db: D1Database, id: string) {
   const row = await db.prepare(
     `SELECT b.*, GROUP_CONCAT(t.name) as tagNames
      FROM bookmark b
@@ -303,9 +332,7 @@ async function getBookmarkWithTags(db: D1Database, id: string, c: any) {
      GROUP BY b.id`
   ).bind(id).first<Record<string, unknown>>();
 
-  if (!row) return c.json({ error: 'Bookmark not found' }, 404);
-
-  return c.json(formatBookmarkRow(row));
+  return row ? formatBookmarkRow(row) : null;
 }
 
 function tagLinkStatements(db: D1Database, bookmarkId: string, tagNames: string[]): D1PreparedStatement[] {

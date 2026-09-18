@@ -26,6 +26,11 @@ function App() {
     _pollTimer: null,
     _lastVersion: null,
 
+    _sync: null,
+    _syncTimer: null,
+    _syncRetry: 0,
+    _syncDirty: false,
+
     _swipeX: null,
     _swipeCleared: {},
 
@@ -38,6 +43,7 @@ function App() {
       const ok = await this.checkAuth();
       if (ok) {
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
+        this.connectSync();
       }
       this.startPolling();
       this.startInfiniteScroll();
@@ -87,19 +93,152 @@ function App() {
       );
     },
 
+    // Fallback for when the live feed is down. While the socket is open the
+    // server pushes changes and nothing here runs.
     startPolling() {
       this._pollTimer = setInterval(() => {
         if (document.visibilityState === 'visible') this.checkForUpdates();
       }, 15000);
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') this.checkForUpdates();
+        if (document.visibilityState !== 'visible') return;
+        this.connectSync();
+        this.flushSync(false);
+        this.checkForUpdates();
       });
+    },
+
+    // Open the live feed. Safe to call at any time; it no-ops unless a new
+    // socket is actually needed.
+    connectSync() {
+      if (!this.authenticated) return;
+      if (this._sync) return;
+
+      const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let ws;
+      try {
+        ws = new WebSocket(`${scheme}//${location.host}/api/sync`);
+      } catch {
+        this.scheduleReconnect();
+        return;
+      }
+      this._sync = ws;
+
+      // Keepalive, answered by the hub without waking it. Per socket, so a
+      // late close from an old socket can't stop the live one pinging.
+      let pingTimer = null;
+
+      ws.addEventListener('open', () => {
+        pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+        }, 45000);
+        // Events sent while we were disconnected are not replayed, so a
+        // reconnect re-reads the list. A retry count means we dropped.
+        if (this._syncRetry > 0) this.flushSync(true);
+        this._syncRetry = 0;
+      });
+
+      ws.addEventListener('message', (e) => {
+        let event;
+        try {
+          event = JSON.parse(e.data);
+        } catch {
+          return; // keepalive replies land here
+        }
+        this.onSyncEvent(event);
+      });
+
+      // 'error' is always followed by 'close', so teardown lives there only.
+      ws.addEventListener('close', () => {
+        clearInterval(pingTimer);
+        if (this._sync !== ws) return; // closed on purpose
+        this._sync = null;
+        this.scheduleReconnect();
+      });
+    },
+
+    disconnectSync() {
+      clearTimeout(this._syncTimer);
+      const ws = this._sync;
+      this._sync = null;
+      this._syncRetry = 0;
+      if (ws) {
+        try {
+          ws.close();
+        } catch {}
+      }
+    },
+
+    // Tell the other tabs about a change this tab is holding locally, before it
+    // reaches the server. Best effort: with the socket down they pick it up
+    // from the poll instead.
+    sendSync(event) {
+      if (!this._sync || this._sync.readyState !== WebSocket.OPEN) return;
+      try {
+        this._sync.send(JSON.stringify(event));
+      } catch {}
+    },
+
+    scheduleReconnect() {
+      if (!this.authenticated) return;
+      clearTimeout(this._syncTimer);
+      const delay = Math.min(30000, 1000 * 2 ** this._syncRetry);
+      this._syncRetry++;
+      this._syncTimer = setTimeout(() => this.connectSync(), delay);
+    },
+
+    // Moving the list now would yank it away from what the user is doing.
+    viewBusy() {
+      return !!this.editing || !!this.pendingDelete || this.page !== 1;
+    },
+
+    onSyncEvent(event) {
+      if (!this.authenticated) return;
+
+      if (event.type === 'deleted') {
+        // Position-independent, so it applies in any view.
+        const gone = this.bookmarks.find((b) => b.id === event.id);
+        this.bookmarks = this.bookmarks.filter((b) => b.id !== event.id);
+        // Tag pills show counts, so they only move if the row carried tags.
+        if (!gone || gone.tags.length) this.loadTags();
+        return;
+      }
+
+      // A re-tag touches every row, a filtered view can't place a change from
+      // the event alone, and a busy view defers: all three want a re-read.
+      if (event.type === 'refresh' || this.viewBusy() || this.searchTerm() || this.activeTag) {
+        this.flushSync(true);
+        return;
+      }
+
+      const bm = event.bookmark;
+      const idx = this.bookmarks.findIndex((b) => b.id === bm.id);
+      if (idx === -1) {
+        // A row we never loaded can only be placed if it sorts to the top,
+        // which is true of a new bookmark and nothing else.
+        if (event.type !== 'created') return;
+        this.bookmarks = [bm, ...this.bookmarks];
+        return; // a new bookmark has no tags yet
+      }
+
+      const before = this.bookmarks[idx];
+      this.bookmarks[idx] = { ...before, ...bm };
+      this.bookmarks = [...this.bookmarks];
+      if (String(before.tags) !== String(bm.tags)) this.loadTags();
+    },
+
+    // Re-read the list. Deferred while the view is busy; loadBookmarks clears
+    // the flag once any full reload lands.
+    flushSync(force) {
+      if (force) this._syncDirty = true;
+      if (!this._syncDirty) return;
+      if (this.viewBusy()) return;
+      return Promise.all([this.loadBookmarks(true), this.loadTags()]);
     },
 
     async checkForUpdates() {
       if (!this.authenticated) return;
-      // Skip while paginated, editing, or holding an undoable delete; picked up later.
-      if (this.page !== 1 || this.editing || this.pendingDelete) return;
+      if (this._sync) return; // the live feed is up, or coming up
+      if (this.viewBusy()) return; // picked up later
 
       let res;
       try {
@@ -115,8 +254,8 @@ function App() {
         return;
       }
       if (version !== this._lastVersion) {
+        await this.flushSync(true);
         this._lastVersion = version;
-        await Promise.all([this.loadBookmarks(true), this.loadTags()]);
       }
     },
 
@@ -148,6 +287,7 @@ function App() {
         this.authenticated = true;
         this.password = '';
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
+        this.connectSync();
       } catch {
         this.loginError = 'connection error';
       } finally {
@@ -161,6 +301,7 @@ function App() {
         credentials: 'same-origin',
       });
       this.authenticated = false;
+      this.disconnectSync();
       this.bookmarks = [];
       this.allTags = [];
     },
@@ -184,7 +325,6 @@ function App() {
             ? `${Math.round((Math.min(offset, res.total) / res.total) * 100)}%`
             : '100%';
         }
-        this._lastVersion = null;
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
         if (failed > 0) {
           alert(`Tag generation failed for ${failed} bookmark${failed === 1 ? '' : 's'} (their existing tags were kept). Check the server logs.`);
@@ -212,14 +352,10 @@ function App() {
         });
         if (res) {
           this.omni = '';
-          if (!this.searchTerm() && !this.activeTag) {
-            if (!this.bookmarks.some((b) => b.id === res.id)) {
-              this.bookmarks = [res, ...this.bookmarks];
-            }
-          }
-          this.loadTags();
           this._lastVersion = null; // re-baseline; our own change isn't a remote update
-          this.pollForMetadata(res.id);
+          // Same placement rules as a save on another device. The echoed event
+          // is idempotent against this, and carries the metadata when it lands.
+          this.onSyncEvent({ type: 'created', bookmark: res });
         }
       } catch (e) {
         this.saveError = e.message;
@@ -228,26 +364,12 @@ function App() {
       }
     },
 
-    async pollForMetadata(id, attempts = 0) {
-      if (attempts >= 3) return;
-      await new Promise((r) => setTimeout(r, 2000));
-      try {
-        const updated = await this.api(`/bookmarks/${id}`);
-        if (!updated) return;
-        const idx = this.bookmarks.findIndex((b) => b.id === id);
-        if (idx === -1) return;
-        const current = this.bookmarks[idx];
-        if (updated.title !== current.title || updated.image !== current.image) {
-          this.bookmarks[idx] = { ...current, ...updated };
-          this.bookmarks = [...this.bookmarks];
-          return;
-        }
-        this.pollForMetadata(id, attempts + 1);
-      } catch {}
-    },
-
     async loadBookmarks(reset) {
-      if (reset) this.page = 1;
+      if (reset) {
+        this.page = 1;
+        this._syncDirty = false;
+        this._lastVersion = null; // any full reload makes the poll baseline stale
+      }
       this.loading = true;
       try {
         const params = new URLSearchParams({
@@ -349,6 +471,7 @@ function App() {
     cancelEdit() {
       this.editing = null;
       this.editTagsInput = '';
+      this.flushSync(false);
     },
 
     async updateBookmark() {
@@ -371,7 +494,6 @@ function App() {
 
         this.editing = null;
         this.editTagsInput = '';
-        this._lastVersion = null; // re-baseline after our own edit
         await Promise.all([this.loadBookmarks(true), this.loadTags()]);
       } catch (e) {
         alert('Failed to update: ' + e.message);
@@ -424,6 +546,9 @@ function App() {
       if (index === -1) return;
       this.bookmarks = this.bookmarks.filter((b) => b.id !== bm.id);
       this.pendingDelete = { bookmark: bm, index };
+      // The DELETE waits out the undo window, so tell the other tabs now
+      // rather than leaving the row on screen for six seconds.
+      this.sendSync({ type: 'deleted', id: bm.id });
       this._undoTimer = setTimeout(() => this.commitDelete(), 6000);
     },
 
@@ -433,6 +558,9 @@ function App() {
       const { bookmark, index } = this.pendingDelete;
       this.pendingDelete = null;
       this.restoreBookmark(bookmark, index);
+      // The row was never deleted, so have the other tabs re-read it.
+      this.sendSync({ type: 'refresh' });
+      this.flushSync(false);
     },
 
     async commitDelete() {
@@ -444,6 +572,7 @@ function App() {
         await this.api(`/bookmarks/${bookmark.id}`, { method: 'DELETE' });
         this._lastVersion = null; // re-baseline after our own delete
         await this.loadTags();
+        this.flushSync(false);
       } catch (e) {
         this.restoreBookmark(bookmark, index);
         alert('Failed to delete: ' + e.message);
