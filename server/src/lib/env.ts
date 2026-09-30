@@ -5,6 +5,7 @@ export type AppEnv = {
   SYNC: DurableObjectNamespace<SyncHub>;
   ASSETS: Fetcher;
   AI: Ai;
+  LOGIN_LIMITER: RateLimit;
   AUTH_PASSWORD: string;
   AUTH_SECRET: string;
 };

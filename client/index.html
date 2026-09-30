@@ -9,7 +9,6 @@
 </head>
 <body>
   <div id="app" v-scope="App()" @vue:mounted="init" v-cloak>
-    <!-- Login -->
     <div v-if="!authenticated" class="container login">
       <h1>Save Bookmarks</h1>
       <form @submit.prevent="login">
@@ -24,7 +23,6 @@
       <p v-if="loginError" class="error">{{ loginError }}</p>
     </div>
 
-    <!-- Main -->
     <div v-else>
       <div class="stack">
         <header class="stack">
@@ -42,12 +40,12 @@
               class="search-input"
             >
             <button v-if="isUrl()" type="submit" class="button-icon" :disabled="saving">
-              <svg fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="size-6">
+              <svg fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
               </svg>
             </button>
             <button v-else type="button" class="button-icon" @click="newNote(omni)" title="New note">
-              <svg fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="size-6">
+              <svg fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
               </svg>
             </button>
@@ -128,22 +126,19 @@
         </button>
       </div>
 
-      <!-- Undo toast -->
       <div v-if="pendingDelete" class="toast" role="status">
-        <span class="toast-text">deleted {{ label(pendingDelete?.bookmark) }}</span>
+        <span class="toast-text">deleted {{ label(pendingDelete.bookmark) }}</span>
         <button @click="undoDelete" class="toast-undo">undo</button>
       </div>
 
-      <!-- Edit modal -->
-      <div v-if="editing" class="modal-overlay" @click.self="cancelEdit">
+      <div v-if="editOpen" class="modal-overlay">
         <div
           class="modal"
           @keydown.escape="cancelEdit"
-          @keydown.enter.meta.prevent="saveEdit"
-          @keydown.enter.ctrl.prevent="saveEdit"
+          @keydown.enter="onModalEnter"
         >
-          <div v-if="editing?.note">
-            <h3>{{ editing?.id ? 'Edit note' : 'New note' }}</h3>
+          <div v-if="editing.note">
+            <h3>{{ editing.id ? 'Edit note' : 'New note' }}</h3>
             <textarea v-model="editing.description" class="note-input" @vue:mounted="$el.focus()"></textarea>
           </div>
           <div v-else>
@@ -153,7 +148,7 @@
             <label>Description</label>
             <textarea v-model="editing.description" rows="3"></textarea>
           </div>
-          <div v-if="editing?.id">
+          <div v-if="editing.id">
             <label>Tags (comma-separated)</label>
             <input type="text" v-model="editTagsInput">
           </div>
@@ -163,21 +158,21 @@
           </div>
         </div>
       </div>
-    </div>
 
-
-  <footer class="container inline-between">
-    <div class="inline-quarter">
-      <button @click="retagAll" :disabled="retagging" class="button-ghost">
-        {{ retagging ? `Re-tagging ${retagProgress}` : 'Re-tag all' }}
-      </button>
-      <button @click="logout" class="button-ghost">Logout</button>
+      <footer class="container inline-quarter">
+        <button @click="retagAll" :disabled="retagging" class="button-ghost">
+          {{ retagging ? `Re-tagging ${retagProgress}` : 'Re-tag all' }}
+        </button>
+        <button @click="logout" class="button-ghost">Logout</button>
+      </footer>
     </div>
-  </footer>
   </div>
 
-
-  <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
+  <script
+    src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"
+    integrity="sha384-G3VE2R9nao/dKH0R46Bvk6qIVBAeImWjeTj+SwWOJzJ4N0vQ2RKWuC/cp36l4Iba"
+    crossorigin="anonymous"
+  ></script>
   <script src="/app.js"></script>
 </body>
 </html>

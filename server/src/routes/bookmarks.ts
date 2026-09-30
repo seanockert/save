@@ -19,9 +19,6 @@ bookmarks.get('/', async (c) => {
   const sort = c.req.query('sort') === 'oldest' ? 'ASC' : 'DESC';
   const offset = (page - 1) * limit;
 
-  let countQuery = 'SELECT COUNT(DISTINCT b.id) as total FROM bookmark b';
-  let dataQuery = `SELECT b.*, GROUP_CONCAT(t.name) as tagNames FROM bookmark b`;
-  const joins = ' LEFT JOIN bookmark_tag bt ON b.id = bt.bookmarkId LEFT JOIN tag t ON bt.tagId = t.id';
   const conditions: string[] = [];
   const params: (string | number)[] = [];
 
@@ -31,23 +28,23 @@ bookmarks.get('/', async (c) => {
   }
 
   if (search) {
-    const like = `%${search}%`;
-    // Notes have a placeholder url, so it is not searchable.
-    conditions.push("(b.title LIKE ? OR b.description LIKE ? OR (b.type = 'bookmark' AND b.url LIKE ?))");
+    const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+    conditions.push(
+      "(b.title LIKE ? ESCAPE '\\' OR b.description LIKE ? ESCAPE '\\' OR (b.type = 'bookmark' AND b.url LIKE ? ESCAPE '\\'))"
+    );
     params.push(like, like, like);
   }
 
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
 
-  countQuery += joins + where;
-  dataQuery += joins + where + ` GROUP BY b.id ORDER BY b.createdAt ${sort} LIMIT ? OFFSET ?`;
-
-  const countParams = [...params];
-  params.push(limit, offset);
+  const countQuery = `SELECT COUNT(*) as total FROM bookmark b${where}`;
+  const dataQuery = `SELECT b.*, GROUP_CONCAT(t.name) as tagNames FROM bookmark b
+    LEFT JOIN bookmark_tag bt ON b.id = bt.bookmarkId LEFT JOIN tag t ON bt.tagId = t.id
+    ${where} GROUP BY b.id ORDER BY b.createdAt ${sort} LIMIT ? OFFSET ?`;
 
   const [countResult, dataResult] = await Promise.all([
-    db.prepare(countQuery).bind(...countParams).first<{ total: number }>(),
-    db.prepare(dataQuery).bind(...params).all(),
+    db.prepare(countQuery).bind(...params).first<{ total: number }>(),
+    db.prepare(dataQuery).bind(...params, limit, offset).all(),
   ]);
 
   const total = countResult?.total || 0;
@@ -62,18 +59,7 @@ bookmarks.get('/', async (c) => {
   });
 });
 
-// Change marker for cross-device polling: count covers adds/deletes,
-// maxUpdatedAt covers edits. Must precede '/:id'.
-bookmarks.get('/version', async (c) => {
-  const row = await c.env.DB.prepare(
-    'SELECT COUNT(*) as count, MAX(updatedAt) as maxUpdatedAt FROM bookmark'
-  ).first<{ count: number; maxUpdatedAt: string | null }>();
-
-  return c.json({ count: row?.count || 0, maxUpdatedAt: row?.maxUpdatedAt || null });
-});
-
-// One-off backfill: re-tag existing bookmarks in batches (the client loops
-// until done) to stay under the subrequest cap. Idempotent.
+// Batched to stay under the subrequest cap; the client loops until done.
 bookmarks.post('/retag', async (c) => {
   const db = c.env.DB;
   const limit = Math.min(20, Math.max(1, Number(c.req.query('limit')) || 20));
@@ -87,29 +73,15 @@ bookmarks.post('/retag', async (c) => {
   ).bind(limit, offset).all<{ id: string; url: string; title: string | null; description: string | null; domain: string; type: string }>();
 
   const batch = rows.results || [];
-  // Established categories from the DB (used by 2+ bookmarks); one-off tags are
-  // deliberately excluded so they don't reinforce themselves during re-tagging.
-  const dbEstablished = await getEstablishedTagNames(db);
-  // Track categories assigned within this run so a category that recurs here
-  // becomes reusable for later items, even before it's persisted.
-  const runCounts = new Map<string, number>();
+  const established = await getEstablishedTagNames(db);
 
   let failed = 0;
   for (const b of batch) {
-    const established = [
-      ...new Set([
-        ...dbEstablished,
-        ...[...runCounts].filter(([, n]) => n >= 2).map(([name]) => name),
-      ]),
-    ];
     const tags = await generateTags(
       c.env.AI,
       { url: b.type === 'text' ? '' : b.url, domain: b.domain, title: b.title, description: b.description },
       established
     );
-    // A genuine failure (null) leaves existing tags intact rather than wiping
-    // them. A successful result — even an empty one — replaces them, so re-tagging
-    // clears stale, low-quality tags a page no longer warrants.
     if (tags === null) {
       failed++;
       continue;
@@ -118,7 +90,6 @@ bookmarks.post('/retag', async (c) => {
       db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(b.id),
       ...tagLinkStatements(db, b.id, tags),
     ]);
-    for (const t of tags) runCounts.set(t, (runCounts.get(t) || 0) + 1);
   }
 
   await cleanupOrphanTags(db);
@@ -126,24 +97,18 @@ bookmarks.post('/retag', async (c) => {
   const nextOffset = offset + batch.length;
   const done = nextOffset >= total || batch.length === 0;
 
-  // Re-tagging touches every bookmark, so tell clients to reload rather than
-  // publishing an event per row.
   if (done) c.executionCtx.waitUntil(publish(c.env, { type: 'refresh' }));
 
   return c.json({ processed: batch.length, failed, total, nextOffset, done });
 });
 
-bookmarks.get('/:id', async (c) => {
-  return await getBookmarkWithTags(c.env.DB, c.req.param('id'), c);
-});
-
 bookmarks.post('/', async (c) => {
   const db = c.env.DB;
-  const body = await c.req.json<{ url?: string; type?: string; description?: string }>();
+  const body = await c.req.json<{ url?: unknown; type?: unknown; description?: unknown }>().catch(() => null);
 
-  if (body.type === 'text') return await createNote(c, body.description);
+  if (body?.type === 'text') return await createNote(c, body.description);
 
-  if (!body.url || typeof body.url !== 'string') {
+  if (!body?.url || typeof body.url !== 'string') {
     return c.json({ error: 'URL is required' }, 400);
   }
 
@@ -158,16 +123,12 @@ bookmarks.post('/', async (c) => {
 
   const existing = await db.prepare('SELECT id FROM bookmark WHERE url = ?').bind(cleanUrl).first<{ id: string }>();
 
-  if (existing) {
-    c.executionCtx.waitUntil(refreshMetadata(c.env, existing.id, cleanUrl));
-    return await getBookmarkWithTags(db, existing.id, c);
-  }
+  if (existing) return c.json(await fetchBookmark(db, existing.id));
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const fallback = fallbackFromUrl(cleanUrl);
 
-  // Tags are generated in refreshMetadata once we have a title/description.
   await db.prepare(
     'INSERT INTO bookmark (id, url, title, description, image, domain, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(id, cleanUrl, fallback.title, null, null, domain, now, now).run();
@@ -179,6 +140,7 @@ bookmarks.post('/', async (c) => {
     description: null,
     image: null,
     domain,
+    type: 'bookmark',
     createdAt: now,
     updatedAt: now,
     tags: [],
@@ -193,7 +155,17 @@ bookmarks.post('/', async (c) => {
 bookmarks.put('/:id', async (c) => {
   const db = c.env.DB;
   const id = c.req.param('id');
-  const body = await c.req.json<{ title?: string; description?: string; tags?: string[] }>();
+  const body = await c.req.json<{ title?: unknown; description?: unknown; tags?: unknown }>().catch(() => null);
+
+  const optionalText = (v: unknown) => v === undefined || v === null || typeof v === 'string';
+  if (
+    !body ||
+    !optionalText(body.title) ||
+    !optionalText(body.description) ||
+    (body.tags !== undefined && !(Array.isArray(body.tags) && body.tags.every((t) => typeof t === 'string')))
+  ) {
+    return c.json({ error: 'Invalid body' }, 400);
+  }
 
   const now = new Date().toISOString();
   const updates: string[] = ['updatedAt = ?'];
@@ -201,11 +173,11 @@ bookmarks.put('/:id', async (c) => {
 
   if (body.title !== undefined) {
     updates.push('title = ?');
-    values.push(body.title);
+    values.push(body.title as string | null);
   }
   if (body.description !== undefined) {
     updates.push('description = ?');
-    values.push(body.description);
+    values.push(body.description as string | null);
   }
 
   const result = await db.prepare(
@@ -219,7 +191,7 @@ bookmarks.put('/:id', async (c) => {
   if (body.tags !== undefined) {
     await db.batch([
       db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(id),
-      ...tagLinkStatements(db, id, body.tags),
+      ...tagLinkStatements(db, id, body.tags as string[]),
     ]);
     await cleanupOrphanTags(db);
   }
@@ -241,7 +213,6 @@ bookmarks.delete('/:id', async (c) => {
     return c.json({ error: 'Bookmark not found' }, 404);
   }
 
-  // links cascade-delete; clear any now-orphaned tags
   await cleanupOrphanTags(db);
 
   c.executionCtx.waitUntil(publish(c.env, { type: 'deleted', id }));
@@ -279,9 +250,7 @@ async function refreshMetadata(env: AppEnv, id: string, url: string) {
       title: ogData.title,
       description: ogData.description,
     });
-  } catch {
-    // Background task — metadata, tags and the broadcast are best-effort; the bookmark is saved.
-  }
+  } catch {}
 }
 
 async function createNote(c: Context<{ Bindings: AppEnv }>, text: unknown) {
@@ -292,7 +261,6 @@ async function createNote(c: Context<{ Bindings: AppEnv }>, text: unknown) {
   const db = c.env.DB;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  // Placeholder url keeps the NOT NULL and UNIQUE constraints satisfied.
   const url = `note:${id}`;
 
   await db.prepare(
@@ -320,16 +288,12 @@ async function createNote(c: Context<{ Bindings: AppEnv }>, text: unknown) {
   return c.json(created, 201);
 }
 
-// Tags the row, reusing established categories where possible, then pushes the
-// finished row to every client (tags land well after the save).
 async function tagAndPublish(env: AppEnv, id: string, input: TagInput) {
   const db = env.DB;
   const established = await getEstablishedTagNames(db);
   const tags = await generateTags(env.AI, input, established);
 
-  // Only replace tags when generation produced something — a failed (null) or
-  // empty result should leave any existing tags intact on a re-fetch.
-  if (tags && tags.length > 0) {
+  if (tags?.length) {
     await db.batch([
       db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(id),
       ...tagLinkStatements(db, id, tags),
@@ -342,9 +306,7 @@ async function tagAndPublish(env: AppEnv, id: string, input: TagInput) {
 }
 
 async function getEstablishedTagNames(db: D1Database): Promise<string[]> {
-  // Only categories used by 2+ bookmarks, most-used first. Excluding the
-  // one-off long tail keeps low-quality tags from being fed back to the model
-  // as examples and reinforcing themselves.
+  // 2+ uses only, so one-off tags don't reinforce themselves.
   const res = await db.prepare(
     `SELECT t.name FROM tag t
      JOIN bookmark_tag bt ON bt.tagId = t.id
@@ -356,14 +318,7 @@ async function getEstablishedTagNames(db: D1Database): Promise<string[]> {
 }
 
 async function cleanupOrphanTags(db: D1Database): Promise<void> {
-  // Remove tags no longer linked to any bookmark.
   await db.prepare('DELETE FROM tag WHERE id NOT IN (SELECT tagId FROM bookmark_tag)').run();
-}
-
-async function getBookmarkWithTags(db: D1Database, id: string, c: any) {
-  const bookmark = await fetchBookmark(db, id);
-  if (!bookmark) return c.json({ error: 'Bookmark not found' }, 404);
-  return c.json(bookmark);
 }
 
 async function fetchBookmark(db: D1Database, id: string) {

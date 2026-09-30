@@ -24,8 +24,6 @@ export function sanitizeUrl(rawUrl: string): string {
     }
   }
 
-  url.hostname = url.hostname.toLowerCase();
-
   if (url.pathname !== '/' && url.pathname.endsWith('/')) {
     url.pathname = url.pathname.slice(0, -1);
   }

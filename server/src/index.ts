@@ -11,7 +11,6 @@ const app = new Hono<Env>();
 app.route('/api/auth', authRoutes);
 app.route('/api/bookmarks', bookmarkRoutes);
 
-// Live change feed. Clients apply the events instead of polling for changes.
 app.get('/api/sync', requireAuth, async (c) => {
   if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') {
     return c.text('Expected WebSocket upgrade', 426);
@@ -22,11 +21,10 @@ app.get('/api/sync', requireAuth, async (c) => {
 app.get('/api/tags', requireAuth, async (c) => {
   const db = c.env.DB;
   const rows = await db.prepare(
-    `SELECT t.name, COUNT(bt.bookmarkId) as count
+    `SELECT t.name, COUNT(*) as count
      FROM tag t
-     LEFT JOIN bookmark_tag bt ON t.id = bt.tagId
+     JOIN bookmark_tag bt ON t.id = bt.tagId
      GROUP BY t.id
-     HAVING count > 0
      ORDER BY count DESC, t.name ASC`
   ).all();
 

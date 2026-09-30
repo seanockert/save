@@ -5,15 +5,18 @@ export interface OGData {
   siteName: string | null;
 }
 
+const CONTENT = `(?:"([^"]*)"|'([^']*)')`;
+
 function extractMetaContent(html: string, property: string): string | null {
   const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = [
-    new RegExp(`<meta[^>]*(?:property|name)=["']${escaped}["'][^>]*content=["']([^"']*)["']`, 'i'),
-    new RegExp(`<meta[^>]*content=["']([^"']*)["'][^>]*(?:property|name)=["']${escaped}["']`, 'i'),
+    new RegExp(`<meta[^>]*(?:property|name)=["']${escaped}["'][^>]*content=${CONTENT}`, 'i'),
+    new RegExp(`<meta[^>]*content=${CONTENT}[^>]*(?:property|name)=["']${escaped}["']`, 'i'),
   ];
   for (const pattern of patterns) {
     const match = html.match(pattern);
-    if (match?.[1]) return decodeEntities(match[1]);
+    const content = match?.[1] ?? match?.[2];
+    if (content) return decodeEntities(content);
   }
   return null;
 }
@@ -77,13 +80,7 @@ const USELESS_TITLES = new Set([
   'access denied', 'log in', 'sign in', 'login', 'sorry',
 ]);
 
-function isGenericTitle(title: string): boolean {
-  return GENERIC_TITLES.has(title.toLowerCase().trim());
-}
-
-function isUselessTitle(title: string): boolean {
-  return USELESS_TITLES.has(title.toLowerCase().trim());
-}
+const MAX_HTML_CHARS = 200_000;
 
 const UA_BROWSER = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_BOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
@@ -159,19 +156,16 @@ async function fetchGenericOG(url: string): Promise<OGData> {
     redirect: 'follow',
   });
 
-  const contentType = res.headers.get('content-type') || '';
-  if (!contentType.includes('text/html')) {
+  const reader = res.body?.getReader();
+  if (!res.ok || !reader || !res.headers.get('content-type')?.includes('text/html')) {
+    reader?.cancel();
     return { title: null, description: null, image: null, siteName: null };
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) return { title: null, description: null, image: null, siteName: null };
-
   let html = '';
   const decoder = new TextDecoder();
-  const maxBytes = 50_000;
 
-  while (html.length < maxBytes) {
+  while (html.length < MAX_HTML_CHARS && !/<\/head>/i.test(html)) {
     const { done, value } = await reader.read();
     if (done) break;
     html += decoder.decode(value, { stream: true });
@@ -183,12 +177,12 @@ async function fetchGenericOG(url: string): Promise<OGData> {
     extractMetaContent(html, 'twitter:title') ??
     extractTitle(html);
 
-  if (title && isUselessTitle(title)) {
+  if (title && USELESS_TITLES.has(title.trim().toLowerCase())) {
     title = null;
   }
 
   const searchQuery = extractSearchQuery(url);
-  if (searchQuery && (!title || isGenericTitle(title))) {
+  if (searchQuery && (!title || GENERIC_TITLES.has(title.trim().toLowerCase()))) {
     title = `Search: ${searchQuery}`;
   }
 
@@ -197,13 +191,10 @@ async function fetchGenericOG(url: string): Promise<OGData> {
     extractMetaContent(html, 'twitter:description') ??
     extractMetaContent(html, 'description');
 
-  let image =
+  const rawImage =
     extractMetaContent(html, 'og:image') ??
     extractMetaContent(html, 'twitter:image');
-
-  if (image && !image.startsWith('http')) {
-    image = resolveUrl(image, url);
-  }
+  const image = rawImage && resolveUrl(rawImage, url);
 
   const siteName = extractMetaContent(html, 'og:site_name');
 
@@ -244,30 +235,15 @@ export function fallbackFromUrl(url: string): OGData {
 export async function fetchOpenGraph(url: string): Promise<OGData> {
   try {
     const platform = await fetchYouTubeOEmbed(url);
+    if (platform?.title && platform.description) return platform;
 
-    if (platform?.title && platform?.description) {
-      return platform;
-    }
-
-    const generic = await fetchGenericOG(url);
-
-    let result: OGData;
+    const result = await fetchGenericOG(url);
     if (platform) {
-      result = {
-        title: platform.title ?? generic.title,
-        description: platform.description ?? generic.description,
-        image: platform.image ?? generic.image,
-        siteName: platform.siteName ?? generic.siteName,
-      };
-    } else {
-      result = generic;
+      for (const key of Object.keys(platform) as (keyof OGData)[]) {
+        result[key] = platform[key] ?? result[key];
+      }
     }
-
-    if (!result.title) {
-      const fallback = fallbackFromUrl(url);
-      result.title = fallback.title;
-    }
-
+    result.title ??= fallbackFromUrl(url).title;
     return result;
   } catch {
     return fallbackFromUrl(url);
