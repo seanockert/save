@@ -347,6 +347,18 @@ header {
   overflow: hidden;
 }
 
+.bookmarks .note-text {
+  font-size: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-clamp: 6;
+}
+
+.note-input {
+  min-height: 8lh;
+  max-height: 60vh;
+}
+
 .bookmark-meta {
   display: flex;
   flex-wrap: wrap;

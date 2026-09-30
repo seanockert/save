@@ -18,6 +18,7 @@ function App() {
 
     editing: null,
     editTagsInput: '',
+    copiedId: null,
 
     retagging: false,
     retagProgress: '',
@@ -341,6 +342,67 @@ function App() {
       if (this.isUrl()) this.saveBookmark();
     },
 
+    // The single-line field drops line breaks, so multi-line pastes go to a note.
+    onOmniPaste(e) {
+      const text = e.clipboardData?.getData('text') || '';
+      if (!text.includes('\n')) return;
+      e.preventDefault();
+      this.newNote(text);
+    },
+
+    isNote(bm) {
+      return bm?.type === 'text';
+    },
+
+    label(bm) {
+      if (!bm) return '';
+      if (this.isNote(bm)) return bm.description.slice(0, 40);
+      return bm.title || bm.url;
+    },
+
+    newNote(text) {
+      this.editing = { id: null, note: true, description: text.trim() };
+      this.editTagsInput = '';
+    },
+
+    async createNote() {
+      const text = this.editing.description.trim();
+      if (!text) return;
+      this.saving = true;
+      try {
+        const res = await this.api('/bookmarks', {
+          method: 'POST',
+          body: { type: 'text', description: text },
+        });
+        if (res) {
+          this.editing = null;
+          this._lastVersion = null; // re-baseline; our own change isn't a remote update
+          if (this.omni) {
+            // The note text came from the field, so leave search mode.
+            this.omni = '';
+            this.writeQueryParams(false);
+            await this.loadBookmarks(true);
+          } else {
+            this.onSyncEvent({ type: 'created', bookmark: res });
+          }
+        }
+      } catch (e) {
+        alert('Failed to save note: ' + e.message);
+      } finally {
+        this.saving = false;
+      }
+    },
+
+    async copyNote(bm) {
+      try {
+        await navigator.clipboard.writeText(bm.description);
+        this.copiedId = bm.id;
+        setTimeout(() => {
+          if (this.copiedId === bm.id) this.copiedId = null;
+        }, 1500);
+      } catch {}
+    },
+
     async saveBookmark() {
       if (!this.isUrl()) return;
       this.saving = true;
@@ -456,12 +518,14 @@ function App() {
       // Don't navigate if the user is selecting text within the card.
       const selection = window.getSelection();
       if (selection && selection.toString().length > 0) return;
-      window.open(bm.url, '_blank', 'noopener');
+      if (this.isNote(bm)) this.editBookmark(bm);
+      else window.open(bm.url, '_blank', 'noopener');
     },
 
     editBookmark(bm) {
       this.editing = {
         id: bm.id,
+        note: this.isNote(bm),
         title: bm.title || '',
         description: bm.description || '',
       };
@@ -472,6 +536,11 @@ function App() {
       this.editing = null;
       this.editTagsInput = '';
       this.flushSync(false);
+    },
+
+    saveEdit() {
+      if (this.editing?.id) this.updateBookmark();
+      else if (this.editing) this.createNote();
     },
 
     async updateBookmark() {
@@ -486,7 +555,7 @@ function App() {
         await this.api(`/bookmarks/${this.editing.id}`, {
           method: 'PUT',
           body: {
-            title: this.editing.title,
+            title: this.editing.note ? undefined : this.editing.title,
             description: this.editing.description,
             tags,
           },

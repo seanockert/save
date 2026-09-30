@@ -6,6 +6,8 @@ const MAX_TAG_LENGTH = 24;
 // Only established, shared categories are shown to the model, so it reuses the
 // vocabulary that already recurs rather than the long tail of one-off tags.
 const MAX_EXISTING_SHOWN = 40;
+// Notes can be long; the start is enough to categorise.
+const MAX_DESCRIPTION_LENGTH = 1500;
 
 // A curated set of broad, single-word browsing categories. These are trusted:
 // the model is steered toward them, and they're exempt from the novelty gates
@@ -70,11 +72,12 @@ function buildPrompt(input: TagInput, establishedTags: string[]): { system: stri
   const user = [
     existing,
     '',
-    'Bookmark:',
-    `URL: ${input.url}`,
-    `Site: ${input.domain}`,
+    // Text notes have no url; their text goes in as the description.
+    input.url ? 'Bookmark:' : 'Text note:',
+    input.url ? `URL: ${input.url}` : null,
+    input.domain ? `Site: ${input.domain}` : null,
     input.title ? `Title: ${input.title}` : null,
-    input.description ? `Description: ${input.description}` : null,
+    input.description ? `Description: ${input.description.slice(0, MAX_DESCRIPTION_LENGTH)}` : null,
   ]
     .filter((line) => line !== null)
     .join('\n');

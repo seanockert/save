@@ -1,8 +1,8 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { requireAuth } from '../lib/auth';
 import { sanitizeUrl, extractDomain } from '../lib/sanitize';
 import { fetchOpenGraph, fallbackFromUrl } from '../lib/opengraph';
-import { generateTags } from '../lib/tags';
+import { generateTags, type TagInput } from '../lib/tags';
 import { publish } from '../lib/sync';
 import type { AppEnv } from '../lib/env';
 
@@ -32,7 +32,8 @@ bookmarks.get('/', async (c) => {
 
   if (search) {
     const like = `%${search}%`;
-    conditions.push('(b.title LIKE ? OR b.description LIKE ? OR b.url LIKE ?)');
+    // Notes have a placeholder url, so it is not searchable.
+    conditions.push("(b.title LIKE ? OR b.description LIKE ? OR (b.type = 'bookmark' AND b.url LIKE ?))");
     params.push(like, like, like);
   }
 
@@ -82,8 +83,8 @@ bookmarks.post('/retag', async (c) => {
   const total = totalRow?.total || 0;
 
   const rows = await db.prepare(
-    'SELECT id, url, title, description, domain FROM bookmark ORDER BY createdAt ASC LIMIT ? OFFSET ?'
-  ).bind(limit, offset).all<{ id: string; url: string; title: string | null; description: string | null; domain: string }>();
+    'SELECT id, url, title, description, domain, type FROM bookmark ORDER BY createdAt ASC LIMIT ? OFFSET ?'
+  ).bind(limit, offset).all<{ id: string; url: string; title: string | null; description: string | null; domain: string; type: string }>();
 
   const batch = rows.results || [];
   // Established categories from the DB (used by 2+ bookmarks); one-off tags are
@@ -103,7 +104,7 @@ bookmarks.post('/retag', async (c) => {
     ];
     const tags = await generateTags(
       c.env.AI,
-      { url: b.url, domain: b.domain, title: b.title, description: b.description },
+      { url: b.type === 'text' ? '' : b.url, domain: b.domain, title: b.title, description: b.description },
       established
     );
     // A genuine failure (null) leaves existing tags intact rather than wiping
@@ -138,7 +139,9 @@ bookmarks.get('/:id', async (c) => {
 
 bookmarks.post('/', async (c) => {
   const db = c.env.DB;
-  const body = await c.req.json<{ url?: string }>();
+  const body = await c.req.json<{ url?: string; type?: string; description?: string }>();
+
+  if (body.type === 'text') return await createNote(c, body.description);
 
   if (!body.url || typeof body.url !== 'string') {
     return c.json({ error: 'URL is required' }, 400);
@@ -270,31 +273,72 @@ async function refreshMetadata(env: AppEnv, id: string, url: string) {
 
     await db.prepare(`UPDATE bookmark SET ${updates.join(', ')} WHERE id = ?`).bind(...values, id).run();
 
-    // Tag from the fresh metadata, reusing established categories where possible.
-    const established = await getEstablishedTagNames(db);
-    const tags = await generateTags(
-      env.AI,
-      { url, domain: extractDomain(url), title: ogData.title, description: ogData.description },
-      established
-    );
-
-    // Only replace tags when generation produced something — a failed (null) or
-    // empty result should leave any existing tags intact on a re-fetch.
-    if (tags && tags.length > 0) {
-      await db.batch([
-        db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(id),
-        ...tagLinkStatements(db, id, tags),
-      ]);
-      await cleanupOrphanTags(db);
-    }
-
-    // The title, image and tags land well after the save, so push the finished
-    // row to every client.
-    const bookmark = await fetchBookmark(db, id);
-    if (bookmark) await publish(env, { type: 'updated', bookmark });
+    await tagAndPublish(env, id, {
+      url,
+      domain: extractDomain(url),
+      title: ogData.title,
+      description: ogData.description,
+    });
   } catch {
     // Background task — metadata, tags and the broadcast are best-effort; the bookmark is saved.
   }
+}
+
+async function createNote(c: Context<{ Bindings: AppEnv }>, text: unknown) {
+  if (typeof text !== 'string' || !text.trim()) {
+    return c.json({ error: 'Text is required' }, 400);
+  }
+
+  const db = c.env.DB;
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  // Placeholder url keeps the NOT NULL and UNIQUE constraints satisfied.
+  const url = `note:${id}`;
+
+  await db.prepare(
+    "INSERT INTO bookmark (id, url, title, description, image, domain, type, createdAt, updatedAt) VALUES (?, ?, NULL, ?, NULL, '', 'text', ?, ?)"
+  ).bind(id, url, text, now, now).run();
+
+  const created = {
+    id,
+    url,
+    title: null,
+    description: text,
+    image: null,
+    domain: '',
+    type: 'text',
+    createdAt: now,
+    updatedAt: now,
+    tags: [],
+  };
+
+  c.executionCtx.waitUntil(publish(c.env, { type: 'created', bookmark: created }));
+  c.executionCtx.waitUntil(
+    tagAndPublish(c.env, id, { url: '', domain: '', title: null, description: text }).catch(() => {})
+  );
+
+  return c.json(created, 201);
+}
+
+// Tags the row, reusing established categories where possible, then pushes the
+// finished row to every client (tags land well after the save).
+async function tagAndPublish(env: AppEnv, id: string, input: TagInput) {
+  const db = env.DB;
+  const established = await getEstablishedTagNames(db);
+  const tags = await generateTags(env.AI, input, established);
+
+  // Only replace tags when generation produced something — a failed (null) or
+  // empty result should leave any existing tags intact on a re-fetch.
+  if (tags && tags.length > 0) {
+    await db.batch([
+      db.prepare('DELETE FROM bookmark_tag WHERE bookmarkId = ?').bind(id),
+      ...tagLinkStatements(db, id, tags),
+    ]);
+    await cleanupOrphanTags(db);
+  }
+
+  const bookmark = await fetchBookmark(db, id);
+  if (bookmark) await publish(env, { type: 'updated', bookmark });
 }
 
 async function getEstablishedTagNames(db: D1Database): Promise<string[]> {
