@@ -339,15 +339,18 @@ header {
 
 .bookmarks p {
   font-size: var(--font-size-small);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   line-clamp: 2;
   overflow: hidden;
 }
 
 .bookmarks .note-text {
-  font-size: inherit;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  line-clamp: 6;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .note-input {

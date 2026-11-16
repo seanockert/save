@@ -448,7 +448,7 @@ function App() {
       }
       const selection = window.getSelection();
       if (selection && selection.toString().length > 0) return;
-      if (this.isNote(bm)) this.editBookmark(bm);
+      if (this.isNote(bm)) this.copyNote(bm);
       else window.open(bm.url, '_blank', 'noopener');
     },
 
