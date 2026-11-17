@@ -1,3 +1,24 @@
+// Swipe distances. REVEAL and EDIT in px, FULL as a fraction of row width.
+const SWIPE_REVEAL = 88;
+const SWIPE_EDIT = 88;
+const SWIPE_FULL = 0.55;
+
+// Not reactive: changes on every pointer move.
+const swipe = { row: null, open: null, moved: false };
+
+const sheet = { el: null, overlay: false };
+
+const isSheet = () => matchMedia('(max-width: 40rem)').matches;
+
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function setOffset(card, dx, animate) {
+  card.style.transition = animate && !reducedMotion()
+    ? 'transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1)'
+    : 'none';
+  card.style.transform = dx ? `translateX(${dx}px)` : '';
+}
+
 function App() {
   return {
     authenticated: false,
@@ -36,7 +57,6 @@ function App() {
 
     pendingDelete: null,
     _undoTimer: null,
-    _rowScrolled: false,
 
     async init() {
       this.readQueryParams();
@@ -55,6 +75,9 @@ function App() {
         if (this.authenticated) this.loadBookmarks(true);
       });
       window.addEventListener('pagehide', () => this.flushPendingDelete());
+      document.addEventListener('pointerdown', (e) => {
+        if (swipe.open && !swipe.open.contains(e.target)) this.closeRow(swipe.open);
+      }, true);
     },
 
     isUrl() {
@@ -291,10 +314,16 @@ function App() {
       return bm?.type === 'text';
     },
 
-    label(bm) {
-      if (!bm) return '';
-      if (this.isNote(bm)) return bm.description.slice(0, 40);
-      return bm.title || bm.url;
+    // Stable hue per domain for image-less tiles.
+    hue(domain) {
+      let h = 0;
+      for (const c of domain || '') h = (h * 31 + c.charCodeAt(0)) % 360;
+      return h;
+    },
+
+    initial(bm) {
+      const name = (bm.domain || bm.title || '?').replace(/^www\./, '');
+      return name.charAt(0).toUpperCase();
     },
 
     newNote(text) {
@@ -442,8 +471,12 @@ function App() {
     },
 
     openBookmark(bm) {
-      if (this._rowScrolled) {
-        this._rowScrolled = false;
+      if (swipe.moved) {
+        swipe.moved = false;
+        return;
+      }
+      if (swipe.open) {
+        this.closeRow(swipe.open);
         return;
       }
       const selection = window.getSelection();
@@ -461,6 +494,56 @@ function App() {
       };
       this.editOpen = true;
       this.editTagsInput = (bm.tags || []).join(', ');
+    },
+
+    // Close on a click that starts and ends on the overlay.
+    overlayDown() {
+      sheet.overlay = true;
+    },
+
+    overlayClick(e) {
+      if (sheet.overlay) this.closeSheet(e.currentTarget.querySelector('.modal'));
+      sheet.overlay = false;
+    },
+
+    // Drag down to close. Not from form fields.
+    sheetDown(e) {
+      sheet.overlay = false;
+      if (e.pointerType === 'mouse' || !isSheet()) return;
+      if (e.target.closest('input, textarea, button')) return;
+      Object.assign(sheet, { el: e.currentTarget, id: e.pointerId, y0: e.clientY, dy: 0, v: 0, t: e.timeStamp });
+      sheet.el.style.transition = 'none';
+      sheet.el.setPointerCapture(e.pointerId);
+    },
+
+    sheetMove(e) {
+      if (!sheet.el || e.pointerId !== sheet.id) return;
+      const dy = Math.max(0, e.clientY - sheet.y0);
+      const dt = e.timeStamp - sheet.t;
+      if (dt > 0) sheet.v = (dy - sheet.dy) / dt;
+      sheet.dy = dy;
+      sheet.t = e.timeStamp;
+      sheet.el.style.transform = `translateY(${dy}px)`;
+    },
+
+    sheetUp(e) {
+      if (!sheet.el || e.pointerId !== sheet.id) return;
+      const { el, dy, v } = sheet;
+      sheet.el = null;
+      if (dy > el.offsetHeight / 3 || (v > 0.5 && dy > 40)) {
+        this.closeSheet(el);
+      } else {
+        el.style.transition = 'transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1)';
+        el.style.transform = '';
+      }
+    },
+
+    closeSheet(el) {
+      if (!el || !isSheet() || reducedMotion()) return this.cancelEdit();
+      el.style.transition = 'transform 0.2s ease-in';
+      el.style.transform = 'translateY(100%)';
+      el.parentElement.classList.add('closing');
+      setTimeout(() => this.cancelEdit(), 200);
     },
 
     cancelEdit() {
@@ -509,39 +592,120 @@ function App() {
       }
     },
 
-    // Not all browsers apply the initial snap.
-    centerRow(el) {
-      requestAnimationFrame(() => {
-        const edit = el.querySelector('.swipe-edit');
-        if (edit) el.scrollLeft = edit.offsetWidth;
+    // Row swipe. Left: delete. Right: edit.
+    rowDown(e, bm) {
+      if (e.pointerType === 'mouse') return;
+      const row = e.currentTarget;
+      if (swipe.open && swipe.open !== row) this.closeRow(swipe.open);
+      swipe.moved = false;
+      const base = row === swipe.open ? -SWIPE_REVEAL : 0;
+      Object.assign(swipe, {
+        row,
+        bm,
+        card: row.querySelector('.card'),
+        id: e.pointerId,
+        x0: e.clientX,
+        y0: e.clientY,
+        base,
+        dx: base,
+        locked: false,
+        armed: false,
+        lastX: e.clientX,
+        lastT: e.timeStamp,
+        v: 0,
       });
     },
 
-    // > 0: towards delete. < 0: towards edit.
-    swipeOffset(el) {
-      return el.scrollLeft + el.clientWidth / 2 - el.scrollWidth / 2;
+    rowMove(e) {
+      if (!swipe.row || e.pointerId !== swipe.id) return;
+      const mx = e.clientX - swipe.x0;
+      const my = e.clientY - swipe.y0;
+      if (!swipe.locked) {
+        if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+        if (Math.abs(my) > Math.abs(mx)) {
+          swipe.row = null;
+          return;
+        }
+        swipe.locked = true;
+        swipe.moved = true;
+        swipe.row.setPointerCapture(e.pointerId);
+      }
+      const w = swipe.row.clientWidth;
+      let dx = swipe.base + mx;
+      if (dx > SWIPE_EDIT) dx = SWIPE_EDIT + (dx - SWIPE_EDIT) * 0.3;
+      dx = Math.max(dx, -w);
+
+      const dt = e.timeStamp - swipe.lastT;
+      if (dt > 0) swipe.v = (e.clientX - swipe.lastX) / dt;
+      swipe.lastX = e.clientX;
+      swipe.lastT = e.timeStamp;
+      swipe.dx = dx;
+
+      const armed = dx < 0 ? -dx > w * SWIPE_FULL : dx >= SWIPE_EDIT;
+      if (armed !== swipe.armed) {
+        swipe.armed = armed;
+        navigator.vibrate?.(10);
+      }
+      swipe.row.dataset.dir = dx < 0 ? 'delete' : 'edit';
+      swipe.row.classList.toggle('armed', armed);
+      this.placeDeleteLabel(swipe.row, dx < 0 && armed ? dx + SWIPE_REVEAL : 0);
+      setOffset(swipe.card, dx, false);
     },
 
-    rowSwipeStart() {
-      this._rowScrolled = false;
+    rowUp(e) {
+      if (!swipe.row || e.pointerId !== swipe.id) return;
+      const { row, bm, dx, v, locked } = swipe;
+      swipe.row = null;
+      if (!locked) return;
+      const w = row.clientWidth;
+      if (dx < 0) {
+        if (-dx > w * SWIPE_FULL) this.animateDelete(row, bm);
+        else if (-dx > SWIPE_REVEAL / 2 || v < -0.4) this.openRow(row);
+        else this.closeRow(row);
+      } else {
+        this.closeRow(row);
+        if (dx >= SWIPE_EDIT || (v > 0.5 && dx > 30)) this.editBookmark(bm);
+      }
     },
 
-    rowSwipeScroll(e) {
-      const el = e.currentTarget;
-      const dx = this.swipeOffset(el);
-      const threshold = el.clientWidth / 2;
-      this._rowScrolled = true;
-      el.classList.toggle('armed-delete', dx >= threshold);
-      el.classList.toggle('armed-edit', dx <= -threshold);
+    rowCancel(e) {
+      if (!swipe.row || e.pointerId !== swipe.id) return;
+      const { row, locked } = swipe;
+      swipe.row = null;
+      if (!locked) return;
+      if (row === swipe.open) this.openRow(row);
+      else this.closeRow(row);
     },
 
-    rowSwipeEnd(e, bm) {
-      const el = e.currentTarget;
-      const dx = this.swipeOffset(el);
-      const threshold = el.clientWidth / 2;
-      el.classList.remove('armed-delete', 'armed-edit');
-      if (dx >= threshold) this.requestDelete(bm);
-      else if (dx <= -threshold) this.editBookmark(bm);
+    // When armed, the delete label follows the card edge.
+    placeDeleteLabel(row, x) {
+      row.querySelector('.swipe-delete .swipe-label').style.transform = x ? `translateX(${x}px)` : '';
+    },
+
+    openRow(row) {
+      swipe.open = row;
+      row.dataset.dir = 'delete';
+      row.classList.remove('armed');
+      this.placeDeleteLabel(row, 0);
+      setOffset(row.querySelector('.card'), -SWIPE_REVEAL, true);
+    },
+
+    closeRow(row) {
+      if (swipe.open === row) swipe.open = null;
+      row.classList.remove('armed');
+      this.placeDeleteLabel(row, 0);
+      setOffset(row.querySelector('.card'), 0, true);
+    },
+
+    async animateDelete(row, bm) {
+      if (swipe.open === row) swipe.open = null;
+      if (!reducedMotion()) {
+        row.style.pointerEvents = 'none';
+        const card = row.querySelector('.card');
+        await card.animate({ transform: `translateX(${-row.clientWidth}px)` }, { duration: 200, easing: 'ease-in', fill: 'forwards' }).finished;
+        await row.animate({ height: [`${row.offsetHeight}px`, '0px'], opacity: [1, 0] }, { duration: 200, fill: 'forwards' }).finished;
+      }
+      this.requestDelete(bm);
     },
 
     requestDelete(bm) {
@@ -550,7 +714,7 @@ function App() {
       if (index === -1) return;
       this.bookmarks = this.bookmarks.filter((b) => b.id !== bm.id);
       this.pendingDelete = { bookmark: bm, index };
-      this._undoTimer = setTimeout(() => this.commitDelete(), 6000);
+      this._undoTimer = setTimeout(() => this.commitDelete(), 3000);
     },
 
     undoDelete() {
