@@ -33,6 +33,10 @@
   color-scheme: light dark;
 }
 
+html {
+  font-size: clamp(100%, 85% + 0.4vw, 125%);
+}
+
 body {
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   font-size:  var(--font-size);
@@ -46,6 +50,12 @@ body {
 
 .container {
   max-width: 40rem;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.container-wide {
+  max-width: 64rem;
   margin: 0 auto;
   width: 100%;
 }
@@ -319,8 +329,9 @@ header {
 /* Bookmarks */
 
 .bookmarks .image {
-  width: 80px;
-  height: 60px;
+  width: 5rem;
+  height: 3.75rem;
+  align-self: start;
   object-fit: cover;
   border-radius: var(--radius);
   flex-shrink: 0;
@@ -359,8 +370,14 @@ header {
   display: block;
 }
 
-.bookmarks a:hover {
-  text-decoration: underline;
+@media (hover: hover) {
+  .card {
+    cursor: pointer;
+  }
+
+  .card:hover:not(:has(.bookmark-actions:hover)) a {
+    text-decoration: underline;
+  }
 }
 
 .bookmarks p {

@@ -32,8 +32,8 @@
 
     <div v-else>
       <div class="stack">
-        <header class="stack container">
-          <form @submit.prevent="onOmniSubmit" class="container inline-quarter save-form">
+        <header class="stack">
+          <form @submit.prevent="onOmniSubmit" class="container-wide inline-quarter save-form">
             <input
               type="search"
               v-model="omni"
@@ -59,7 +59,7 @@
           </form>
           <p v-if="saveError" class="error">{{ saveError }}</p>
         </header>
-        <div v-if="allTags.length" class="container inline-quarter inline-wrap px">
+        <div v-if="allTags.length" class="container-wide inline-quarter inline-wrap px">
           <button
             v-for="tag in allTags"
             :key="tag.name"
@@ -72,7 +72,7 @@
         </div>
       </div>
 
-      <div class="container bookmarks">
+      <div class="container-wide bookmarks">
         <div
           v-for="bm in bookmarks"
           :key="bm.id"
@@ -177,7 +177,7 @@
         </div>
       </div>
 
-      <footer class="container inline-quarter">
+      <footer class="container-wide inline-quarter">
         <button @click="retagAll" :disabled="retagging" class="button-ghost">
           {{ retagging ? `Re-tagging ${retagProgress}` : 'Re-tag all' }}
         </button>
